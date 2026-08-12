@@ -385,10 +385,19 @@ class WorldPipeline(ConfigMixin):
         self.custom_conditioning_imports = {}
         self.custom_conditioning_import_origins = {}
         self.custom_conditioning_default_values = {}
+        self.custom_conditioning_periodic = set()
 
     def _has_custom_conditioning_imports(self) -> bool:
         """True once :meth:`set_custom_conditioning_import` has stored at least one channel."""
         return bool(self.custom_conditioning_imports)
+
+    def _has_full_periodic_conditioning(self) -> bool:
+        """True when all five channels are installed as periodic rasters."""
+        return all(
+            channel in self.custom_conditioning_imports
+            and channel in self.custom_conditioning_periodic
+            for channel in range(5)
+        )
 
     def _get_padded_batch_size(self, actual_size: int) -> int:
         """Get the next highest legal batch size for padding."""
@@ -783,6 +792,9 @@ class WorldPipeline(ConfigMixin):
         origin_i: int,
         origin_j: int,
         default_value: float | None = None,
+        *,
+        periodic: bool = False,
+        rebuild: bool = True,
     ) -> None:
         """Install a 2-D raster for coarse conditioning (used by ``tiff_export``).
 
@@ -793,11 +805,12 @@ class WorldPipeline(ConfigMixin):
 
         The array ``values[h, w]`` is anchored so ``values[0, 0]`` is world cell
         ``(origin_i, origin_j)``. Outside the raster footprint, windows use synthetic
-        Perlin unless ``default_value`` is set.
+        Perlin unless ``default_value`` is set. When ``periodic`` is true, coordinates
+        wrap with modular arithmetic and the raster covers the entire infinite plane.
 
         After the first call, coarse conditioning uses the import path (merged Perlin + TIFFs,
         no synthetic ``finalize``, ``sqrt`` on elevation only); see :meth:`_conditioning_model_input`.
-        Calls :meth:`rebuild` (no-op if :meth:`bind` has not run yet).
+        Calls :meth:`rebuild` when ``rebuild`` is true (no-op if :meth:`bind` has not run yet).
 
         Args:
             channel: Index ``0..4``.
@@ -805,6 +818,8 @@ class WorldPipeline(ConfigMixin):
             origin_i: Top-left row in conditioning cells.
             origin_j: Top-left column in conditioning cells.
             default_value: Optional fill where the import does not apply.
+            periodic: If true, tile the raster across all coordinates.
+            rebuild: If false, defer :meth:`rebuild` so callers can batch updates.
         """
         values = np.asarray(values, dtype=np.float32)
         if values.ndim != 2:
@@ -816,7 +831,57 @@ class WorldPipeline(ConfigMixin):
             self.custom_conditioning_default_values.pop(channel, None)
         else:
             self.custom_conditioning_default_values[channel] = float(default_value)
-        self.rebuild()
+        if periodic:
+            self.custom_conditioning_periodic.add(channel)
+        else:
+            self.custom_conditioning_periodic.discard(channel)
+        if rebuild:
+            self.rebuild()
+
+    def set_periodic_conditioning_imports(
+        self,
+        channels: dict[int, np.ndarray],
+        *,
+        rebuild: bool = True,
+    ) -> None:
+        """Install one or more periodic conditioning rasters with a single optional rebuild.
+
+        Args:
+            channels: Mapping of channel index ``0..4`` to 2-D float arrays in internal units.
+            rebuild: If true (default), rebuild tile stages once after all channels are stored.
+        """
+        if not channels:
+            raise ValueError("channels must contain at least one entry.")
+        for channel, values in channels.items():
+            self.set_custom_conditioning_import(
+                int(channel),
+                values,
+                origin_i=0,
+                origin_j=0,
+                default_value=None,
+                periodic=True,
+                rebuild=False,
+            )
+        if rebuild:
+            self.rebuild()
+
+    def change_seed_with_periodic_conditioning(
+        self,
+        seed: int | None,
+        channels: dict[int, np.ndarray],
+    ) -> bool:
+        """Set seed and replace periodic conditioning in a single rebuild.
+
+        Avoids the intermediate rebuild that :meth:`change_seed` would perform against
+        stale imports. Returns True when the seed or conditioning was applied.
+        """
+        new_seed = (int(seed) & 0xFFFFFFFFFFFFFFFF) if seed is not None else next_seed(None)
+        seed_changed = new_seed != self.seed
+        self.seed = new_seed
+        self.set_periodic_conditioning_imports(channels, rebuild=False)
+        if self.tile_store is not None:
+            self.rebuild()
+        return seed_changed or True
 
     def _sample_raw_conditioning(self, ci0: int, ci1: int, cj0: int, cj1: int) -> np.ndarray:
         """Perlin stack for ``[ci0:ci1) × [cj0:cj1)`` before finalize."""
@@ -826,11 +891,29 @@ class WorldPipeline(ConfigMixin):
             dtype=np.float32,
         )
 
+    def _sample_periodic_conditioning_channel(
+        self,
+        channel: int,
+        ci0: int,
+        ci1: int,
+        cj0: int,
+        cj1: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample a periodic import with modular wrap for any integer window."""
+        import_values = self.custom_conditioning_imports[channel]
+        period_h, period_w = import_values.shape
+        rows = np.mod(np.arange(ci0, ci1, dtype=np.int64), period_h)
+        cols = np.mod(np.arange(cj0, cj1, dtype=np.int64), period_w)
+        values = import_values[np.ix_(rows, cols)].astype(np.float32, copy=False)
+        mask = np.ones(values.shape, dtype=bool)
+        return values, mask
+
     def _sample_custom_conditioning_channel(self, channel: int, ci0: int, ci1: int, cj0: int, cj1: int):
         """Build per-channel override grid for window ``[ci0:ci1) x [cj0:cj1)``.
 
         Copies the overlapping region from :attr:`custom_conditioning_imports` and
         honors :attr:`custom_conditioning_default_values` for cells outside the import.
+        Periodic channels wrap with modular arithmetic instead of using a finite AABB.
 
         Returns:
             ``(None, None)`` if this channel has no import and no default value.
@@ -841,6 +924,9 @@ class WorldPipeline(ConfigMixin):
         default_value = self.custom_conditioning_default_values.get(channel)
         if import_values is None and default_value is None:
             return None, None
+
+        if import_values is not None and channel in self.custom_conditioning_periodic:
+            return self._sample_periodic_conditioning_channel(channel, ci0, ci1, cj0, cj1)
 
         h = ci1 - ci0
         w = cj1 - cj0
@@ -872,6 +958,17 @@ class WorldPipeline(ConfigMixin):
 
     def _raw_conditioning_with_imports(self, ci0: int, ci1: int, cj0: int, cj1: int) -> np.ndarray:
         """Merge Perlin raw stack with GeoTIFF imports (imported-coarse mode only)."""
+        if self._has_full_periodic_conditioning():
+            height = ci1 - ci0
+            width = cj1 - cj0
+            stacked = np.empty((5, height, width), dtype=np.float32)
+            for channel in range(5):
+                values, _mask = self._sample_periodic_conditioning_channel(
+                    channel, ci0, ci1, cj0, cj1
+                )
+                stacked[channel] = values
+            return stacked
+
         raw = self._sample_raw_conditioning(ci0, ci1, cj0, cj1)
         for channel in range(raw.shape[0]):
             values, mask = self._sample_custom_conditioning_channel(channel, ci0, ci1, cj0, cj1)
@@ -887,7 +984,8 @@ class WorldPipeline(ConfigMixin):
 
         If :meth:`_has_custom_conditioning_imports` (``set_custom_conditioning_import`` has been
         called): merge Perlin raw with TIFFs, **no** synthetic ``finalize``; only
-        ``sign(x) * sqrt(|x|)`` on channel 0. Channels 1–4 are merged values.
+        ``sign(x) * sqrt(|x|)`` on channel 0. Channels 1–4 are merged values. When all five
+        channels are periodic imports, Perlin is skipped entirely.
 
         Args:
             ci0, ci1: Inclusive-exclusive row bounds (``i1``, ``i2``).
